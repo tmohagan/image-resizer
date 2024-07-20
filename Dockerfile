@@ -1,4 +1,4 @@
-FROM rust:1.72 as builder
+FROM rust:latest as builder
 WORKDIR /usr/src/image-resizer
 COPY . .
 RUN cargo install --path .
