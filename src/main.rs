@@ -6,19 +6,20 @@ use image::ImageOutputFormat;
 use std::io::Cursor;
 use std::env;
 use log::{info, error};
+use dotenv::dotenv;
 
 async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
     info!("Received resize request");
     while let Ok(Some(mut field)) = payload.try_next().await {
-        let content_type = field.content_disposition().ok_or_else(|| {
-            error!("Content-Type not found");
-            actix_web::error::ErrorBadRequest("Content-Type not found")
-        })?;
+        let content_disposition = field.content_disposition();
         
-        let filename = content_type.get_filename().ok_or_else(|| {
-            error!("Filename not found");
-            actix_web::error::ErrorBadRequest("Filename not found")
-        })?;
+        let filename = content_disposition
+            .get_filename()
+            .map(|f| f.to_owned())
+            .ok_or_else(|| {
+                error!("Filename not found");
+                actix_web::error::ErrorBadRequest("Filename not found")
+            })?;
 
         let mut bytes = web::BytesMut::new();
         while let Some(chunk) = field.next().await {
@@ -33,10 +34,14 @@ async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
             actix_web::error::ErrorBadRequest(e.to_string())
         })?;
         
-        let resized = img.resize_exact(800, 600, image::imageops::FilterType::Lanczos3);
+        let width = env::var("RESIZE_WIDTH").unwrap_or_else(|_| "800".to_string()).parse().unwrap_or(800);
+        let height = env::var("RESIZE_HEIGHT").unwrap_or_else(|_| "600".to_string()).parse().unwrap_or(600);
+        let quality = env::var("JPEG_QUALITY").unwrap_or_else(|_| "80".to_string()).parse().unwrap_or(80);
+
+        let resized = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
 
         let mut cursor = Cursor::new(Vec::new());
-        resized.write_to(&mut cursor, ImageOutputFormat::Jpeg(80))
+        resized.write_to(&mut cursor, ImageOutputFormat::Jpeg(quality))
             .map_err(|e| {
                 error!("Error writing image: {:?}", e);
                 actix_web::error::ErrorInternalServerError(e.to_string())
@@ -57,19 +62,24 @@ async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Initialize logger
+    dotenv().ok();
+    
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Get the port from the environment variable or use a default
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("0.0.0.0:{}", port);
+    let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr = format!("{}:{}", host, port);
+
+    let allowed_origins: Vec<String> = env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "https://www.tim-ohagan.com,https://mern-blog-api-rouge.vercel.app".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
 
     info!("Starting server at: {}", addr);
 
-    HttpServer::new(|| {
-        let cors = Cors::default()
-            .allowed_origin("https://www.tim-ohagan.com")
-            .allowed_origin("https://mern-blog-api-rouge.vercel.app")
+    HttpServer::new(move || {
+        let mut cors = Cors::default()
             .allowed_methods(vec!["GET", "POST"])
             .allowed_headers(vec![
                 actix_web::http::header::AUTHORIZATION,
@@ -77,6 +87,10 @@ async fn main() -> std::io::Result<()> {
                 actix_web::http::header::CONTENT_TYPE,
             ])
             .max_age(3600);
+
+        for origin in &allowed_origins {
+            cors = cors.allowed_origin(origin);
+        }
 
         App::new()
             .wrap(cors)
