@@ -2,11 +2,26 @@ use actix_web::{web, App, HttpServer, HttpResponse, Error};
 use actix_multipart::Multipart;
 use actix_cors::Cors;
 use futures::{StreamExt, TryStreamExt};
-use image::ImageOutputFormat;
+use image::{ImageOutputFormat, DynamicImage};
 use std::io::Cursor;
 use std::env;
 use log::{info, error};
 use dotenv::dotenv;
+use lru_cache::LruCache;
+use std::sync::Mutex;
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref CACHE: Mutex<LruCache<String, Vec<u8>>> = Mutex::new(LruCache::new(100));
+}
+
+fn resize_image_rayon(img: DynamicImage, width: u32, height: u32, quality: u8) -> Vec<u8> {
+    let resized = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+    let mut cursor = Cursor::new(Vec::new());
+    resized.write_to(&mut cursor, ImageOutputFormat::Jpeg(quality)).unwrap();
+    cursor.into_inner()
+}
 
 async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
     info!("Received resize request");
@@ -29,23 +44,33 @@ async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
             })?);
         }
 
-        let img = image::load_from_memory(&bytes).map_err(|e| {
-            error!("Error loading image: {:?}", e);
-            actix_web::error::ErrorBadRequest(e.to_string())
-        })?;
-        
         let width = env::var("RESIZE_WIDTH").unwrap_or_else(|_| "800".to_string()).parse().unwrap_or(800);
         let height = env::var("RESIZE_HEIGHT").unwrap_or_else(|_| "600".to_string()).parse().unwrap_or(600);
         let quality = env::var("JPEG_QUALITY").unwrap_or_else(|_| "80".to_string()).parse().unwrap_or(80);
 
-        let resized = img.resize_exact(width, height, image::imageops::FilterType::Lanczos3);
+        let cache_key = format!("{}_{}_{}_{}", filename, width, height, quality);
+        
+        if let Some(cached_image) = CACHE.lock().unwrap().get_mut(&cache_key) {
+            info!("Serving cached image for '{}'", filename);
+            return Ok(HttpResponse::Ok()
+                .content_type("image/jpeg")
+                .append_header((
+                    "Content-Disposition", 
+                    format!("attachment; filename=\"resized_{filename}\"")
+                ))
+                .body(cached_image.clone()));
+        }
 
-        let mut cursor = Cursor::new(Vec::new());
-        resized.write_to(&mut cursor, ImageOutputFormat::Jpeg(quality))
-            .map_err(|e| {
-                error!("Error writing image: {:?}", e);
-                actix_web::error::ErrorInternalServerError(e.to_string())
-            })?;
+        let img = image::load_from_memory(&bytes).map_err(|e| {
+            error!("Error loading image: {:?}", e);
+            actix_web::error::ErrorBadRequest(e.to_string())
+        })?;
+
+        let resized_image = web::block(move || {
+            resize_image_rayon(img, width, height, quality)
+        }).await?;
+
+        CACHE.lock().unwrap().insert(cache_key, resized_image.clone());
 
         info!("Image '{}' resized successfully", filename);
         return Ok(HttpResponse::Ok()
@@ -54,7 +79,7 @@ async fn resize_image(mut payload: Multipart) -> Result<HttpResponse, Error> {
                 "Content-Disposition", 
                 format!("attachment; filename=\"resized_{filename}\"")
             ))
-            .body(cursor.into_inner()));
+            .body(resized_image));
     }
     
     Err(actix_web::error::ErrorBadRequest("No image found"))
